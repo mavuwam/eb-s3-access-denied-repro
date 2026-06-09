@@ -81,6 +81,7 @@ jobs:
         run: |
           echo "=== Uploading artifact to S3 ==="
           aws s3 cp app.zip s3://${{ env.S3_BUCKET }}/${{ env.APPLICATION_NAME }}/app.zip \
+            --acl bucket-owner-full-control \
             --region ${{ env.AWS_REGION }}
           echo "✓ Upload successful"
           echo ""

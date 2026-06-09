@@ -36,14 +36,30 @@ Resources:
   # but EB/CloudFormation can't read it during deployment.
   SourceBucket:
     Type: AWS::S3::Bucket
-    Properties:
-      OwnershipControls:
-        Rules:
-          - ObjectOwnership: BucketOwnerEnforced
 
-  # No restrictive bucket policy - let IAM policies handle access control.
-  # The EB managed policies (AWSElasticBeanstalkEnhancedHealth, ManagedUpdates)
-  # grant the service role sufficient S3 access by default.
+  # Bucket policy to allow the EB service-linked role to read source bundles.
+  # EB uses AWSServiceRoleForElasticBeanstalk internally to copy source bundles,
+  # and that role only has default S3 access on elasticbeanstalk-* buckets.
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEBServiceLinkedRole
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/elasticbeanstalk.amazonaws.com/AWSServiceRoleForElasticBeanstalk'
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:GetObjectAcl
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub '${SourceBucket.Arn}/*'
 
   # ── Deployer Role (simulates Github_worker) ────────────────────
   # This role can upload to S3 and create app versions, but has
@@ -76,12 +92,7 @@ Resources:
               # Can upload artifacts to S3
               - Effect: Allow
                 Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                  - s3:GetObjectVersion
-                  - s3:ListBucket
-                  - s3:CreateBucket
-                  - s3:GetBucketLocation
+                  - s3:*
                 Resource:
                   - !GetAtt SourceBucket.Arn
                   - !Sub '${SourceBucket.Arn}/*'
