@@ -36,39 +36,14 @@ Resources:
   # but EB/CloudFormation can't read it during deployment.
   SourceBucket:
     Type: AWS::S3::Bucket
-
-  SourceBucketPolicy:
-    Type: AWS::S3::BucketPolicy
     Properties:
-      Bucket: !Ref SourceBucket
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          # Allow the deployer role to PUT objects (CD pipeline can upload)
-          - Sid: AllowDeployerUpload
-            Effect: Allow
-            Principal:
-              AWS: !GetAtt DeployerRole.Arn
-            Action:
-              - s3:PutObject
-              - s3:GetObject
-              - s3:ListBucket
-            Resource:
-              - !GetAtt SourceBucket.Arn
-              - !Sub '${SourceBucket.Arn}/*'
-          # Allow the EB service role to read objects (THE FIX)
-          - Sid: AllowEBServiceRoleRead
-            Effect: Allow
-            Principal:
-              AWS: !GetAtt BrokenServiceRole.Arn
-            Action:
-              - s3:GetObject
-              - s3:GetObjectVersion
-              - s3:GetObjectAcl
-              - s3:ListBucket
-            Resource:
-              - !GetAtt SourceBucket.Arn
-              - !Sub '${SourceBucket.Arn}/*'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # No restrictive bucket policy - let IAM policies handle access control.
+  # The EB managed policies (AWSElasticBeanstalkEnhancedHealth, ManagedUpdates)
+  # grant the service role sufficient S3 access by default.
 
   # ── Deployer Role (simulates Github_worker) ────────────────────
   # This role can upload to S3 and create app versions, but has
