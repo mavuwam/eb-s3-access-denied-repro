@@ -125,19 +125,32 @@ jobs:
           echo "=== Waiting for deployment to complete ==="
           echo "Waiting for environment to start updating..."
           
-          MAX_WAIT=300
+          MAX_WAIT=600
           ELAPSED=0
           
-          # First wait for the environment to enter Updating status
-          while [ $ELAPSED -lt 60 ]; do
+          # Record the version BEFORE we wait
+          OLD_VERSION=$(aws elasticbeanstalk describe-environments \
+            --environment-names ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Environments[0].VersionLabel' \
+            --output text)
+          echo "Old version: $OLD_VERSION"
+          
+          # Wait until the environment enters Updating status OR version changes
+          while [ $ELAPSED -lt 90 ]; do
             STATUS=$(aws elasticbeanstalk describe-environments \
               --environment-names ${{ env.ENVIRONMENT_NAME }} \
               --region ${{ env.AWS_REGION }} \
               --query 'Environments[0].Status' \
               --output text)
+            CURRENT_VER=$(aws elasticbeanstalk describe-environments \
+              --environment-names ${{ env.ENVIRONMENT_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Environments[0].VersionLabel' \
+              --output text)
             
-            if [ "$STATUS" = "Updating" ]; then
-              echo "Environment is now updating..."
+            if [ "$STATUS" = "Updating" ] || [ "$CURRENT_VER" != "$OLD_VERSION" ]; then
+              echo "Environment is updating (Status=$STATUS, Version=$CURRENT_VER)..."
               break
             fi
             sleep 5
