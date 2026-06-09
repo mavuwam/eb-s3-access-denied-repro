@@ -123,9 +123,29 @@ jobs:
       - name: Wait for deployment
         run: |
           echo "=== Waiting for deployment to complete ==="
-          echo "Polling environment status every 15 seconds..."
+          echo "Waiting for environment to start updating..."
           
           MAX_WAIT=300
+          ELAPSED=0
+          
+          # First wait for the environment to enter Updating status
+          while [ $ELAPSED -lt 60 ]; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names ${{ env.ENVIRONMENT_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Environments[0].Status' \
+              --output text)
+            
+            if [ "$STATUS" = "Updating" ]; then
+              echo "Environment is now updating..."
+              break
+            fi
+            sleep 5
+            ELAPSED=$((ELAPSED + 5))
+          done
+          
+          # Now wait for it to return to Ready
+          echo "Polling environment status every 15 seconds..."
           ELAPSED=0
           
           while [ $ELAPSED -lt $MAX_WAIT ]; do
