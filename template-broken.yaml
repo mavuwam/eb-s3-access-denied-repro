@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Replicates the customer S3 Access Denied issue during EB deployment.
+  The EB service role lacks s3:GetObject permission on the source bucket,
+  causing CloudFormation to fail with:
+    "Service:AmazonCloudFormation, Message:S3 error: Access Denied"
+  
+  This mimics the customer scenario where:
+  - Application versions are created successfully (visible in EB console)
+  - But deployment fails because CF/EB cannot read the source bundle from S3
+  - No 403 shows up in access logs because the denial happens at the IAM/bucket-policy level
+  - s3:HeadBucket is not a real IAM action (it maps to s3:ListBucket)
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: innoslate-repro
+    Description: Name of the Elastic Beanstalk application
+
+  EnvironmentName:
+    Type: String
+    Default: InnoslateTest-repro
+    Description: Name of the EB environment (mimics customer env)
+
+Resources:
+  # ── EB Application ─────────────────────────────────────────────
+  Application:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      Description: Repro for S3 Access Denied during EB deployment
+
+  # ── S3 Source Bucket with RESTRICTIVE policy ───────────────────
+  # This bucket policy explicitly denies the EB service role from reading objects.
+  # This replicates the customer issue where the CD pipeline uploads the artifact
+  # but EB/CloudFormation can't read it during deployment.
+  SourceBucket:
+    Type: AWS::S3::Bucket
+
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow the deployer role to PUT objects (CD pipeline can upload)
+          - Sid: AllowDeployerUpload
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt DeployerRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub '${SourceBucket.Arn}/*'
+          # DENY the EB service role from reading objects
+          # This is the root cause of the customer issue
+          - Sid: DenyEBServiceRoleRead
+            Effect: Deny
+            Principal:
+              AWS: !GetAtt BrokenServiceRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub '${SourceBucket.Arn}/*'
+
+  # ── Deployer Role (simulates Github_worker) ────────────────────
+  # This role can upload to S3 and create app versions, but has
+  # limited EB permissions — similar to a CI/CD worker role.
+  DeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-github-worker'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref 'AWS::AccountId'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DeployerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Can upload artifacts to S3
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:CreateBucket
+                  - s3:GetBucketLocation
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub '${SourceBucket.Arn}/*'
+                  - 'arn:aws:s3:::elasticbeanstalk-*'
+                  - 'arn:aws:s3:::elasticbeanstalk-*/*'
+              # Can create application versions and trigger deployments
+              - Effect: Allow
+                Action:
+                  - elasticbeanstalk:*
+                Resource: '*'
+              # CloudFormation permissions needed for EB update
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: '*'
+              # Auto Scaling and EC2 for EB managed updates
+              - Effect: Allow
+                Action:
+                  - autoscaling:*
+                  - ec2:Describe*
+                  - elasticloadbalancing:Describe*
+                  - logs:*
+                  - cloudwatch:*
+                Resource: '*'
+
+  # ── Broken EB Service Role (missing S3 read) ───────────────────
+  # The customer's issue: the EB service role doesn't have sufficient
+  # S3 permissions. Enhanced health policy is attached but the explicit
+  # Deny in bucket policy blocks access.
+  BrokenServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-eb-service-broken'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+      # NOTE: No explicit S3 read on the source bucket. Combined with the
+      # bucket policy Deny statement, this causes the Access Denied error.
+
+  # ── EC2 Instance Role ──────────────────────────────────────────
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ── EB Environment (will fail on deploy) ───────────────────────
+  Environment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref Application
+      EnvironmentName: !Ref EnvironmentName
+      SolutionStackName: '64bit Amazon Linux 2023 v4.10.0 running Python 3.11'
+      OptionSettings:
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref InstanceProfile
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: SingleInstance
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !GetAtt BrokenServiceRole.Arn
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: ENV_TYPE
+          Value: broken-repro
+
+  # ── Fixed Service Role (for comparison/fix) ────────────────────
+  # Uncomment and swap to this role to fix the issue
+  # FixedServiceRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     RoleName: !Sub '${ApplicationName}-eb-service-fixed'
+  #     AssumeRolePolicyDocument:
+  #       Version: '2012-10-17'
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service: elasticbeanstalk.amazonaws.com
+  #           Action: 'sts:AssumeRole'
+  #     ManagedPolicyArns:
+  #       - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+  #       - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+  #     Policies:
+  #       - PolicyName: S3SourceAccess
+  #         PolicyDocument:
+  #           Version: '2012-10-17'
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - s3:GetObject
+  #                 - s3:GetObjectVersion
+  #                 - s3:ListBucket
+  #               Resource:
+  #                 - !GetAtt SourceBucket.Arn
+  #                 - !Sub '${SourceBucket.Arn}/*'
+
+Outputs:
+  EnvironmentURL:
+    Description: URL of the EB environment
+    Value: !GetAtt Environment.EndpointURL
+
+  SourceBucketName:
+    Description: S3 bucket for application source
+    Value: !Ref SourceBucket
+
+  DeployerRoleArn:
+    Description: Role ARN for the CD pipeline (Github_worker equivalent)
+    Value: !GetAtt DeployerRole.Arn
+
+  ServiceRoleArn:
+    Description: EB Service Role (broken - missing S3 access)
+    Value: !GetAtt BrokenServiceRole.Arn

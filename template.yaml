@@ -1,0 +1,130 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Elastic Beanstalk Sample Application'
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: sample-eb-app
+    Description: Name of the Elastic Beanstalk application
+  
+  BasicEnvName:
+    Type: String
+    Default: sample-eb-basic
+    Description: Name of the basic monitoring environment
+
+  EnhancedEnvName:
+    Type: String
+    Default: sample-eb-enhanced
+    Description: Name of the enhanced monitoring environment
+
+Resources:
+  # Elastic Beanstalk Application
+  Application:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      Description: Sample Elastic Beanstalk Application
+
+
+
+  # S3 Bucket for application source
+  SourceBucket:
+    Type: AWS::S3::Bucket
+
+  # IAM Role for EC2 instances
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWorkerTier
+
+  # Instance Profile
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # Basic Monitoring Environment
+  BasicEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref Application
+      EnvironmentName: !Ref BasicEnvName
+      SolutionStackName: '64bit Amazon Linux 2023 v4.10.0 running Python 3.11'
+      OptionSettings:
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref InstanceProfile
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: SingleInstance
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !GetAtt ServiceRole.Arn
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: basic
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: ENV_TYPE
+          Value: basic
+
+  # Enhanced Monitoring Environment
+  EnhancedEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref Application
+      EnvironmentName: !Ref EnhancedEnvName
+      SolutionStackName: '64bit Amazon Linux 2023 v4.10.0 running Python 3.11'
+      OptionSettings:
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref InstanceProfile
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: SingleInstance
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !GetAtt ServiceRole.Arn
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: ENV_TYPE
+          Value: enhanced
+
+  # Service Role for Elastic Beanstalk
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+
+Outputs:
+  BasicEnvironmentURL:
+    Description: URL of the basic monitoring environment
+    Value: !GetAtt BasicEnvironment.EndpointURL
+
+  EnhancedEnvironmentURL:
+    Description: URL of the enhanced monitoring environment
+    Value: !GetAtt EnhancedEnvironment.EndpointURL
+  
+  SourceBucketName:
+    Description: S3 bucket for application source
+    Value: !Ref SourceBucket

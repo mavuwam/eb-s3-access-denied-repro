@@ -1,0 +1,5 @@
+app.zip
+*.zip
+.DS_Store
+var/
+Github Actions Deploy.yml logs/

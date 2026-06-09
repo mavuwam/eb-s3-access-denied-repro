@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Full repro of customer S3 Access Denied issue with GitHub Actions OIDC.
+  Deploys: OIDC provider, Github_worker role, EB app, broken service role,
+  and the S3 bucket with a restrictive policy.
+
+Parameters:
+  ApplicationName:
+    Type: String
+    Default: innoslate-repro
+    Description: Name of the Elastic Beanstalk application
+
+  EnvironmentName:
+    Type: String
+    Default: InnoslateTest-repro
+    Description: Name of the EB environment
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization or username
+    Default: CHANGEME
+
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name
+    Default: innoslate-eb-deploy
+
+Conditions:
+  HasGitHubOrg: !Not [!Equals [!Ref GitHubOrg, 'CHANGEME']]
+
+Resources:
+  # ── GitHub OIDC Provider ───────────────────────────────────────
+  # Allows GitHub Actions to assume IAM roles without static credentials
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: HasGitHubOrg
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ── Deployer Role (Github_worker) ──────────────────────────────
+  # This is assumed by GitHub Actions via OIDC.
+  # It CAN upload to S3 and create EB versions, but the EB service
+  # role will fail when trying to read the artifact.
+  DeployerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-github-worker'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow OIDC from GitHub Actions
+          - !If
+            - HasGitHubOrg
+            - Effect: Allow
+              Principal:
+                Federated: !Ref GitHubOIDCProvider
+              Action: 'sts:AssumeRoleWithWebIdentity'
+              Condition:
+                StringEquals:
+                  'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com'
+                StringLike:
+                  'token.actions.githubusercontent.com:sub': !Sub 'repo:${GitHubOrg}/${GitHubRepo}:*'
+            - !Ref 'AWS::NoValue'
+          # Also allow same-account assume (for local testing with deploy scripts)
+          - Effect: Allow
+            Principal:
+              AWS: !Ref 'AWS::AccountId'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DeployerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Upload
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SourceBucket.Arn
+                  - !Sub '${SourceBucket.Arn}/*'
+              - Sid: EBDeploy
+                Effect: Allow
+                Action:
+                  - elasticbeanstalk:CreateApplicationVersion
+                  - elasticbeanstalk:UpdateEnvironment
+                  - elasticbeanstalk:DescribeEnvironments
+                  - elasticbeanstalk:DescribeEvents
+                  - elasticbeanstalk:DescribeApplicationVersions
+                Resource: '*'
+
+  # ── EB Application ─────────────────────────────────────────────
+  Application:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: !Ref ApplicationName
+      Description: Repro for S3 Access Denied (GitHub Actions pipeline)
+
+  # ── S3 Source Bucket ───────────────────────────────────────────
+  SourceBucket:
+    Type: AWS::S3::Bucket
+
+  # ── Restrictive Bucket Policy (THE ROOT CAUSE) ─────────────────
+  # This Deny statement blocks the EB service role from reading objects.
+  # The deployer CAN upload, but EB/CF CANNOT download during deployment.
+  SourceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SourceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowDeployerFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt DeployerRole.Arn
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SourceBucket.Arn
+              - !Sub '${SourceBucket.Arn}/*'
+          # THIS DENY CAUSES THE ISSUE
+          - Sid: DenyEBServiceRoleRead
+            Effect: Deny
+            Principal:
+              AWS: !GetAtt BrokenServiceRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+            Resource:
+              - !Sub '${SourceBucket.Arn}/*'
+
+  # ── Broken EB Service Role ─────────────────────────────────────
+  # Has managed policies but is blocked by the bucket policy Deny.
+  BrokenServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ApplicationName}-eb-service-broken'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+
+  # ── EC2 Instance Role ──────────────────────────────────────────
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  # ── EB Environment ─────────────────────────────────────────────
+  Environment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref Application
+      EnvironmentName: !Ref EnvironmentName
+      SolutionStackName: '64bit Amazon Linux 2023 v4.10.0 running Python 3.11'
+      OptionSettings:
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref InstanceProfile
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: EnvironmentType
+          Value: SingleInstance
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !GetAtt BrokenServiceRole.Arn
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: ENV_TYPE
+          Value: broken-repro
+
+Outputs:
+  EnvironmentURL:
+    Description: EB environment URL
+    Value: !GetAtt Environment.EndpointURL
+
+  EnvironmentCNAME:
+    Description: EB environment CNAME
+    Value: !Sub '${EnvironmentName}.eba-23ukjkim.${AWS::Region}.elasticbeanstalk.com'
+
+  SourceBucketName:
+    Description: S3 bucket for application source
+    Value: !Ref SourceBucket
+
+  DeployerRoleArn:
+    Description: Role ARN for GitHub Actions (set as AWS_DEPLOY_ROLE_ARN secret)
+    Value: !GetAtt DeployerRole.Arn
+
+  ServiceRoleArn:
+    Description: EB Service Role (broken)
+    Value: !GetAtt BrokenServiceRole.Arn
+
+  GitHubSecretsInstructions:
+    Description: GitHub repository secrets to configure
+    Value: !Sub |
+      Set these GitHub repo secrets:
+        AWS_DEPLOY_ROLE_ARN = ${DeployerRole.Arn}

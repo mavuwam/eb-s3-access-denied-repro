@@ -1,0 +1,204 @@
+# ==============================================================================
+# GitHub Actions - Deploy to Elastic Beanstalk
+# ==============================================================================
+# This replicates the customer's CD pipeline that:
+#   1. Builds the app artifact
+#   2. Uploads to S3
+#   3. Creates EB application version
+#   4. Triggers EB environment update
+#
+# The deployment FAILS at step 4 with:
+#   "Service:AmazonCloudFormation, Message:S3 error: Access Denied"
+#
+# The Github_worker role CAN upload and create versions, but the EB Service
+# Role cannot READ the artifact from S3 due to a bucket policy Deny.
+# ==============================================================================
+
+name: Deploy to Elastic Beanstalk
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: 'InnoslateTest-repro'
+        type: choice
+        options:
+          - InnoslateTest-repro
+          - sample-eb-basic
+          - sample-eb-enhanced
+
+env:
+  AWS_REGION: eu-north-1
+  APPLICATION_NAME: innoslate-repro
+  ENVIRONMENT_NAME: ${{ github.event.inputs.environment || 'InnoslateTest-repro' }}
+  S3_BUCKET: innoslate-repro-stack-sourcebucket-d4xqasd5x2sg
+
+permissions:
+  id-token: write   # Required for OIDC authentication
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy to EB
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # ── Configure AWS credentials (OIDC) ────────────────────────────
+      # Uses the Github_worker role via OIDC federation
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          # Expected: arn:aws:iam::382207551874:role/innoslate-repro-github-worker
+          aws-region: ${{ env.AWS_REGION }}
+
+      # ── Verify identity ─────────────────────────────────────────────
+      - name: Verify AWS identity
+        run: |
+          echo "=== AWS Identity ==="
+          aws sts get-caller-identity
+          echo ""
+          echo "Role: $(aws sts get-caller-identity --query 'Arn' --output text)"
+
+      # ── Build artifact ──────────────────────────────────────────────
+      - name: Package application
+        run: |
+          echo "=== Packaging application ==="
+          zip -r app.zip application.py requirements.txt
+          echo "Artifact size: $(du -h app.zip | cut -f1)"
+          echo "SHA256: $(sha256sum app.zip | cut -d' ' -f1)"
+
+      # ── Upload to S3 ───────────────────────────────────────────────
+      - name: Upload to S3
+        run: |
+          echo "=== Uploading artifact to S3 ==="
+          aws s3 cp app.zip s3://${{ env.S3_BUCKET }}/${{ env.APPLICATION_NAME }}/app.zip \
+            --region ${{ env.AWS_REGION }}
+          echo "✓ Upload successful"
+          echo ""
+          echo "Verifying upload..."
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${{ env.APPLICATION_NAME }}/app.zip \
+            --region ${{ env.AWS_REGION }}
+
+      # ── Create application version ─────────────────────────────────
+      - name: Create application version
+        id: version
+        run: |
+          VERSION_LABEL="v4.14.1.0-${GITHUB_SHA::7}-$(date +%Y%m%d-%H%M%S)"
+          echo "version_label=$VERSION_LABEL" >> $GITHUB_OUTPUT
+          
+          echo "=== Creating application version: $VERSION_LABEL ==="
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ env.APPLICATION_NAME }} \
+            --version-label "$VERSION_LABEL" \
+            --source-bundle S3Bucket=${{ env.S3_BUCKET }},S3Key=${{ env.APPLICATION_NAME }}/app.zip \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✓ Version created successfully"
+
+      # ── Deploy to environment ──────────────────────────────────────
+      # THIS IS WHERE THE ERROR OCCURS
+      # The update-environment call succeeds (it's async), but the actual
+      # deployment fails when EB/CloudFormation tries to read the S3 bundle.
+      - name: Deploy to environment
+        run: |
+          echo "=== Deploying ${{ steps.version.outputs.version_label }} to ${{ env.ENVIRONMENT_NAME }} ==="
+          aws elasticbeanstalk update-environment \
+            --application-name ${{ env.APPLICATION_NAME }} \
+            --environment-name ${{ env.ENVIRONMENT_NAME }} \
+            --version-label "${{ steps.version.outputs.version_label }}" \
+            --region ${{ env.AWS_REGION }}
+          
+          echo "✓ Deployment triggered"
+
+      # ── Wait for deployment ────────────────────────────────────────
+      - name: Wait for deployment
+        run: |
+          echo "=== Waiting for deployment to complete ==="
+          echo "Polling environment status every 15 seconds..."
+          
+          MAX_WAIT=300
+          ELAPSED=0
+          
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws elasticbeanstalk describe-environments \
+              --environment-names ${{ env.ENVIRONMENT_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Environments[0].Status' \
+              --output text)
+            
+            HEALTH=$(aws elasticbeanstalk describe-environments \
+              --environment-names ${{ env.ENVIRONMENT_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --query 'Environments[0].Health' \
+              --output text)
+            
+            echo "[$(date +%H:%M:%S)] Status: $STATUS | Health: $HEALTH | Elapsed: ${ELAPSED}s"
+            
+            if [ "$STATUS" = "Ready" ]; then
+              echo ""
+              echo "Environment is Ready."
+              break
+            fi
+            
+            sleep 15
+            ELAPSED=$((ELAPSED + 15))
+          done
+          
+          # Check for errors in events
+          echo ""
+          echo "=== Recent Environment Events ==="
+          aws elasticbeanstalk describe-events \
+            --environment-name ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --max-records 10 \
+            --query 'Events[].{Severity:Severity,Message:Message}' \
+            --output table
+
+      # ── Verify deployment ──────────────────────────────────────────
+      - name: Verify deployment
+        if: always()
+        run: |
+          echo "=== Deployment Verification ==="
+          
+          VERSION=$(aws elasticbeanstalk describe-environments \
+            --environment-names ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Environments[0].VersionLabel' \
+            --output text)
+          
+          HEALTH=$(aws elasticbeanstalk describe-environments \
+            --environment-names ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Environments[0].Health' \
+            --output text)
+          
+          echo "Current version: $VERSION"
+          echo "Expected version: ${{ steps.version.outputs.version_label }}"
+          echo "Health: $HEALTH"
+          
+          if [ "$VERSION" != "${{ steps.version.outputs.version_label }}" ]; then
+            echo ""
+            echo "❌ DEPLOYMENT FAILED - version mismatch"
+            echo "   The environment is still running the old version."
+            echo "   Check events for: 'Service:AmazonCloudFormation, Message:S3 error: Access Denied'"
+            echo ""
+            echo "=== Error Events ==="
+            aws elasticbeanstalk describe-events \
+              --environment-name ${{ env.ENVIRONMENT_NAME }} \
+              --region ${{ env.AWS_REGION }} \
+              --max-records 20 \
+              --query 'Events[?Severity==`ERROR`].{Time:EventDate,Message:Message}' \
+              --output table
+            exit 1
+          fi
+          
+          echo "✓ Deployment verified successfully"
