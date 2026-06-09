@@ -82,6 +82,15 @@ Resources:
             Principal:
               AWS: !Ref 'AWS::AccountId'
             Action: 'sts:AssumeRole'
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com'
+              StringLike:
+                'token.actions.githubusercontent.com:sub': 'repo:mavuwam/eb-s3-access-denied-repro:*'
       Policies:
         - PolicyName: DeployerPolicy
           PolicyDocument:
