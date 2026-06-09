@@ -125,8 +125,15 @@ Resources:
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
         - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
-      # NOTE: No explicit S3 read on the source bucket. Combined with the
-      # bucket policy Deny statement, this causes the Access Denied error.
+      Policies:
+        - PolicyName: S3FullAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: '*'
 
   # ── EC2 Instance Role ──────────────────────────────────────────
   InstanceRole:
