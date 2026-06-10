@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Deployment Monitor",
+  "description": "After any deploy script is edited, automatically check the EB environment health and recent events to catch failures early.",
+  "version": "1",
+  "when": {
+    "type": "fileEdited",
+    "patterns": [
+      "deploy-*.sh"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "A deploy script was modified. Run `aws elasticbeanstalk describe-environments --environment-names InnoslateTest-repro --region eu-north-1 --query 'Environments[0].{Status:Status,Health:Health,Version:VersionLabel}' --output table` and `aws elasticbeanstalk describe-events --environment-name InnoslateTest-repro --region eu-north-1 --max-records 5 --query 'Events[?Severity==\\`ERROR\\`]' --output table` to check if the environment is healthy. Report any issues found."
+  }
+}

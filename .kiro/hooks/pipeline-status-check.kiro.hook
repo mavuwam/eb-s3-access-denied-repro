@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "name": "Pipeline Status Check",
+  "description": "After the agent stops working, check the GitHub Actions pipeline status for the repo to surface any failed runs.",
+  "version": "1",
+  "when": {
+    "type": "agentStop"
+  },
+  "then": {
+    "type": "runCommand",
+    "command": "gh run list --repo mavuwam/eb-s3-access-denied-repro --limit 3 --json status,conclusion,name,createdAt,url | python3 -c \"import sys,json; runs=json.load(sys.stdin); failed=[r for r in runs if r.get('conclusion')=='failure']; print(f'Pipeline Status: {len(failed)}/{len(runs)} failed') if runs else print('No runs found'); [print(f'  ❌ {r[\\\"name\\\"]} - {r[\\\"createdAt\\\"]}') for r in failed]\""
+  }
+}

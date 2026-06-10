@@ -1,0 +1,144 @@
+# ==============================================================================
+# GitHub Actions - Pipeline & Deployment Monitor
+# ==============================================================================
+# Runs on a schedule and on workflow failures to:
+#   - Check EB environment health
+#   - Report deployment status
+#   - Alert on failures
+# ==============================================================================
+
+name: Pipeline Monitor
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'  # Every 30 minutes
+  workflow_run:
+    workflows: ["Deploy to Elastic Beanstalk"]
+    types: [completed]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: eu-north-1
+  APPLICATION_NAME: innoslate-repro
+  ENVIRONMENT_NAME: InnoslateTest-repro
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+  issues: write
+
+jobs:
+  monitor:
+    name: Check Pipeline & Environment Health
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check EB Environment Health
+        id: eb_health
+        run: |
+          echo "=== EB Environment Health Check ==="
+          
+          ENV_DATA=$(aws elasticbeanstalk describe-environments \
+            --environment-names ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Environments[0]' \
+            --output json)
+          
+          STATUS=$(echo "$ENV_DATA" | jq -r '.Status')
+          HEALTH=$(echo "$ENV_DATA" | jq -r '.Health')
+          HEALTH_STATUS=$(echo "$ENV_DATA" | jq -r '.HealthStatus')
+          VERSION=$(echo "$ENV_DATA" | jq -r '.VersionLabel')
+          
+          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          echo "health=$HEALTH" >> $GITHUB_OUTPUT
+          echo "health_status=$HEALTH_STATUS" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          
+          echo "Environment: ${{ env.ENVIRONMENT_NAME }}"
+          echo "Status: $STATUS"
+          echo "Health: $HEALTH ($HEALTH_STATUS)"
+          echo "Version: $VERSION"
+          
+          if [ "$HEALTH" = "Red" ] || [ "$HEALTH" = "Severe" ]; then
+            echo "health_alert=true" >> $GITHUB_OUTPUT
+            echo "::error::Environment health is $HEALTH"
+          else
+            echo "health_alert=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Recent Deployment Events
+        id: events
+        run: |
+          echo "=== Recent Events (last 10) ==="
+          
+          ERRORS=$(aws elasticbeanstalk describe-events \
+            --environment-name ${{ env.ENVIRONMENT_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --max-records 20 \
+            --query 'Events[?Severity==`ERROR`].{Time:EventDate,Message:Message}' \
+            --output json)
+          
+          ERROR_COUNT=$(echo "$ERRORS" | jq 'length')
+          echo "error_count=$ERROR_COUNT" >> $GITHUB_OUTPUT
+          
+          if [ "$ERROR_COUNT" -gt "0" ]; then
+            echo "::warning::Found $ERROR_COUNT error events in recent history"
+            echo "$ERRORS" | jq -r '.[] | "\(.Time) - \(.Message)"'
+          else
+            echo "No recent errors"
+          fi
+
+      - name: Check Last Deploy Workflow Run
+        if: github.event_name == 'workflow_run'
+        run: |
+          echo "=== Triggered by Deploy Workflow ==="
+          echo "Conclusion: ${{ github.event.workflow_run.conclusion }}"
+          echo "Run ID: ${{ github.event.workflow_run.id }}"
+          echo "URL: ${{ github.event.workflow_run.html_url }}"
+          
+          if [ "${{ github.event.workflow_run.conclusion }}" = "failure" ]; then
+            echo "::error::Deploy workflow FAILED - Run: ${{ github.event.workflow_run.html_url }}"
+          fi
+
+      - name: Create Issue on Failure
+        if: steps.eb_health.outputs.health_alert == 'true' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Pipeline Alert: ${context.repo.repo}`;
+            const health = '${{ steps.eb_health.outputs.health }}';
+            const status = '${{ steps.eb_health.outputs.status }}';
+            const version = '${{ steps.eb_health.outputs.version }}';
+            const errorCount = '${{ steps.events.outputs.error_count }}';
+            
+            const body = `## Pipeline Monitor Alert
+            
+            | Check | Value |
+            |-------|-------|
+            | Environment | ${{ env.ENVIRONMENT_NAME }} |
+            | Health | ${health} |
+            | Status | ${status} |
+            | Version | ${version} |
+            | Recent Errors | ${errorCount} |
+            | Trigger | ${context.eventName} |
+            | Time | ${new Date().toISOString()} |
+            
+            ### Action Required
+            - Check [environment events](https://eu-north-1.console.aws.amazon.com/elasticbeanstalk/home?region=eu-north-1#/environment/dashboard?environmentId=${{ env.ENVIRONMENT_NAME }})
+            - Review [workflow runs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions)
+            `;
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['alert', 'pipeline']
+            });

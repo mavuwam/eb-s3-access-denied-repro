@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudWatch monitoring for EB environments - alarms, dashboard, and SNS alerts
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: InnoslateTest-repro
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for alerts (leave empty to skip SNS)
+
+Conditions:
+  HasEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  # ── SNS Topic for Alerts ───────────────────────────────────────
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasEmail
+    Properties:
+      TopicName: eb-pipeline-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── Environment Health Alarm ───────────────────────────────────
+  HealthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-health-degraded'
+      AlarmDescription: EB environment health is degraded or worse
+      Namespace: AWS/ElasticBeanstalk
+      MetricName: EnvironmentHealth
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !If [HasEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+
+  # ── 5xx Error Rate Alarm ───────────────────────────────────────
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-5xx-errors'
+      AlarmDescription: Application returning 5xx errors
+      Namespace: AWS/ElasticBeanstalk
+      MetricName: ApplicationRequests5xx
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [HasEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+
+  # ── High Latency Alarm ─────────────────────────────────────────
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-high-latency'
+      AlarmDescription: Application P99 latency above 5 seconds
+      Namespace: AWS/ElasticBeanstalk
+      MetricName: ApplicationLatencyP99
+      Dimensions:
+        - Name: EnvironmentName
+          Value: !Ref EnvironmentName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If [HasEmail, !Ref AlertTopic, !Ref 'AWS::NoValue']
+
+  # ── Dashboard ──────────────────────────────────────────────────
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${EnvironmentName}-pipeline-monitor'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Environment Health",
+                "metrics": [
+                  ["AWS/ElasticBeanstalk", "EnvironmentHealth", "EnvironmentName", "${EnvironmentName}"]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60,
+                "stat": "Maximum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Request Count",
+                "metrics": [
+                  ["AWS/ElasticBeanstalk", "ApplicationRequests2xx", "EnvironmentName", "${EnvironmentName}", {"color": "#2ca02c"}],
+                  ["AWS/ElasticBeanstalk", "ApplicationRequests4xx", "EnvironmentName", "${EnvironmentName}", {"color": "#ff7f0e"}],
+                  ["AWS/ElasticBeanstalk", "ApplicationRequests5xx", "EnvironmentName", "${EnvironmentName}", {"color": "#d62728"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Sum"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Latency (P50, P90, P99)",
+                "metrics": [
+                  ["AWS/ElasticBeanstalk", "ApplicationLatencyP50", "EnvironmentName", "${EnvironmentName}", {"label": "P50"}],
+                  ["AWS/ElasticBeanstalk", "ApplicationLatencyP90", "EnvironmentName", "${EnvironmentName}", {"label": "P90"}],
+                  ["AWS/ElasticBeanstalk", "ApplicationLatencyP99", "EnvironmentName", "${EnvironmentName}", {"label": "P99"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 300,
+                "stat": "Average"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Instance Health",
+                "metrics": [
+                  ["AWS/ElasticBeanstalk", "InstancesOk", "EnvironmentName", "${EnvironmentName}", {"color": "#2ca02c"}],
+                  ["AWS/ElasticBeanstalk", "InstancesDegraded", "EnvironmentName", "${EnvironmentName}", {"color": "#ff7f0e"}],
+                  ["AWS/ElasticBeanstalk", "InstancesSevere", "EnvironmentName", "${EnvironmentName}", {"color": "#d62728"}]
+                ],
+                "region": "${AWS::Region}",
+                "period": 60,
+                "stat": "Maximum"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${EnvironmentName}-pipeline-monitor'
+
+  AlertTopicArn:
+    Condition: HasEmail
+    Description: SNS Topic for alerts
+    Value: !Ref AlertTopic

@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "name": "Safe Deploy Guard",
+  "description": "Before any shell command runs, verify it is not accidentally targeting production resources or deleting EB environments.",
+  "version": "1",
+  "when": {
+    "type": "preToolUse",
+    "toolTypes": [
+      "shell"
+    ]
+  },
+  "then": {
+    "type": "askAgent",
+    "prompt": "Check if this shell command could delete or terminate an EB environment, delete a CloudFormation stack, or remove S3 objects in production. If it contains 'terminate-environment', 'delete-stack', 'rm -rf', or 's3 rm --recursive' on a non-test resource, warn about the risk. Otherwise, allow it to proceed."
+  }
+}
